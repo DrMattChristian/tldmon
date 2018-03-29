@@ -219,7 +219,7 @@ sub do_analyze {
 	critical("$min_ns has expired RRSIGs") if ($min_exp < $NOW);
 	if ($min_exp - $NOW < ($opts{C}*86400)) {
 		my $ND = sprintf "%3.1f days", ($min_exp-$NOW)/86400;
-		warning("$min_type RRSIG expires in $ND at $min_ns")
+		critical("$min_type RRSIG expires in $ND at $min_ns")
 	}
 	if ($min_exp - $NOW < ($opts{W}*86400)) {
 		my $ND = sprintf "%3.1f days", ($min_exp-$NOW)/86400;
