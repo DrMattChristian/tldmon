@@ -257,7 +257,7 @@ sub do_analyze {
 		critical($soa_pkt->header->rcode . " from %NS%", $ns) unless ($soa_pkt->header->rcode eq 'NOERROR');
 		$N++;
 	    }
-	    $success_msg .= "$N NSs are responding; ";
+	    $success_msg .= "$N NSs are responding, ";
 	}
 
 	# LAME CHECK
@@ -270,7 +270,7 @@ sub do_analyze {
 		critical("%NS% is lame", $ns) if is_lame($soa_pkt);
 		$N++;
 	    }
-	    $success_msg .= "$N NSs are NOT lame; ";
+	    $success_msg .= "$N NSs are NOT lame, ";
 	}
 
 	# NSSET CHECK
@@ -310,7 +310,7 @@ sub do_analyze {
 		push(@x, "$nses do NOT list $k");
 	    }
 	    critical("NS RRset inconsistency: ". join('; ', @x)) if @x;
-	    $success_msg .= "$N NSs have consistent NS RRset; ";
+	    $success_msg .= "$N NSs have consistent NS RRset, ";
 	}
 
 	# NSSET CHECK
@@ -334,7 +334,7 @@ sub do_analyze {
 		push(@x, "AT PARENT ONLY: ". join(' ', $lc->get_Lonly)) if $lc->get_Lonly;
 		push(@x, "IN ZONE ONLY: ". join(' ', $lc->get_Ronly)) if $lc->get_Ronly;
 		critical(join('; ', @x)) if @x;
-		$success_msg .= "Parent and Zone NS RRsets match; ";
+		$success_msg .= "Parent and Zone NS RRsets match, ";
 	}
 
 
@@ -348,7 +348,7 @@ sub do_analyze {
 		critical("%NS% is NOT authoritative", $ns) unless $soa_pkt->header->aa;
 		$N++;
 	    }
-	    $success_msg .= "$N NSs are authoritative; ";
+	    $success_msg .= "$N NSs are authoritative, ";
 	}
 
 	# SERIAL CHECK
@@ -382,7 +382,7 @@ sub do_analyze {
 		#
 		critical("%NS% serial ($serial) is less than the maximum ($maxserial)", $ns);
 	    }
-	    $success_msg .= "$N NSs have serial $maxserial; ";
+	    $success_msg .= "$N NSs have serial $maxserial, ";
 	}
 
 	# OPENRES CHECK
@@ -396,7 +396,7 @@ sub do_analyze {
 		$N++;
 	    }
 	    # This message WAS "closed to recursion"
-	    $success_msg .= "$N NSs are NOT open resolvers; ";
+	    $success_msg .= "$N NSs are NOT open resolvers, ";
 	}
 
 	# TCP CHECK
@@ -415,7 +415,7 @@ sub do_analyze {
 		my $such = (keys %broke)[0];
 		critical("$K of $N NSs (such as %NS%) do NOT support TCP", $such);
 	    }
-	    $success_msg .= "$N NSs support TCP; ";
+	    $success_msg .= "$N NSs support TCP, ";
 	}
 
 	# EDNS0 CHECK
@@ -440,7 +440,7 @@ sub do_analyze {
 		critical("%NS% does NOT support EDNS0 (rcode $rc)", $ns) unless $rc eq 'NOERROR';
 		$N++;
 	    }
-	    $success_msg .= "$N NSs support EDNS0; ";
+	    $success_msg .= "$N NSs support EDNS0, ";
 	}
 
 	# IPv6 CHECK
@@ -475,7 +475,7 @@ sub do_analyze {
 		critical("%NS% does NOT support IPv6 (rcode $rc)", $ns, 'AAAA') unless $rc eq 'NOERROR';
 		$N++;
 	    }
-	    $success_msg .= "$N NSs support IPv6; ";
+	    $success_msg .= "$N NSs support IPv6, ";
 	}
 
 	## Clock skew
@@ -511,7 +511,7 @@ sub do_analyze {
 	    }
 	    critical("%NS% clock skew is $maxskew seconds", $maxskew_ns, 'A') if $maxskew > 60;
 	    warning("%NS% clock skew is $maxskew seconds", $maxskew_ns, 'A') if $maxskew > 15;
-	    $success_msg .= "$N NS clocks in sync; ";
+	    $success_msg .= "$N NS clocks in sync, ";
 	}
 
 	success($success_msg);
@@ -567,7 +567,8 @@ sub output {
 	$msg =~ s/%NS%/$ns/g if $ns;
 	$stop = [gettimeofday()] unless $stop;
 	my $latency = tv_interval($start, $stop);
-	printf "%s; (%.2fs) |time=%.6fs;;;0.000000\n",
+	printf "ZONE %s: %s; (%.2fs) |time=%.6fs;;;0.000000\n",
+		$state,
 		$msg,
 		$latency,
 		$latency;
