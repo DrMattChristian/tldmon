@@ -1,5 +1,9 @@
 # Nagios Plugin Scripts for TLDmon
 
+Matt Christian merged different versions between DNS-OARC TLDmon and
+The Measurement Factory to retain improvements and bug fixes in both.
+Neither upstream fork appears to be actively maintained or updated.
+
 TLDmon uses two Nagios plugin scripts to implement the service checks.
 Both scripts originally come from The Measurement Factory. We've made
 some modifications for TLDmon and publish the modified versions here.
@@ -17,3 +21,8 @@ checks.
 The modifications to this script are minor. For TLDmon we've changed
 the "critical" result codes to "warning" and also changed the output
 format a little.
+
+## LICENSE
+
+License is same BSD 3-clause as original creator.
+The Measurement Factory, Inc. retains all copyrights.

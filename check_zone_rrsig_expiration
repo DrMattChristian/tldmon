@@ -1,10 +1,10 @@
-#!/usr/local/bin/perl
+#!/usr/bin/perl
 
-# $Id: check_zone_rrsig_expiration,v 1.18 2014/02/22 18:48:41 wfms Exp $
+# $Id: check_zone_rrsig_expiration,v 1.19 2018/03/28 15:18:41 matt.christian Exp $
 #
 # check_zone_rrsig_expiration
 #
-# nagios plugin to check expiration times of RRSIG records.  Reminds
+# Nagios plugin to check expiration times of RRSIG records.  Reminds
 # you if its time to re-sign your zone.
 
 # Copyright (c) 2008, The Measurement Factory, Inc. All rights reserved.
@@ -39,7 +39,7 @@
 #
 # define command {
 #   command_name    check-zone-rrsig
-#   command_line    /usr/local/libexec/nagios-local/check_zone_rrsig -Z $HOSTADDRESS$
+#   command_line    /usr/lib64/nagios/plugins/check_zone_rrsig_expiration -Z $HOSTADDRESS$
 # }
 #
 # define service {
@@ -63,24 +63,44 @@ use warnings;
 use strict;
 
 use Getopt::Std;
+# The RRSIG sigexpiration code requires Net::DNS 1.01 or newer PM.
+# Older Net::DNS versions cannot correctly process RRSIG records.
+use Net::DNS 1.01;
 use Net::DNS::Resolver;
-use Time::HiRes qw ( gettimeofday tv_interval);
+use Time::HiRes qw ( gettimeofday tv_interval );
 use Time::Local;
 use List::Util qw ( shuffle );
 
-my %opts = (t=>30);
-getopts('Z:dt:', \%opts);
+# Try to load Net::DNS::Sec PM for optional DNSSEC support.
+my $nds = eval {
+  require Net::DNS::SEC;
+  NET::DNS::SEC->import();
+  1;
+};
+
+
+# options
+#  -Z zone        Zone to test
+#  -t seconds     DNS query timeout (default 30 seconds)
+#  -d             Enable debugging output
+#  -4             Use IPv4 query only
+#  -W days        Warning if expiring in X days (default 2.5)
+#  -C days        Critical if expiring in X days (default 1)
+#  -T type        Query type (default RRSIG)
+#  -U size        EDNS0 UDP packet size (default 4096)
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+$main::VERSION = '1.19';
+my %opts = (t=>30, C=>1, W=>2.5, T=>'RRSIG', U=>4096);
+getopts('4Z:dht:W:C:T:U:', \%opts);
 usage() unless $opts{Z};
 usage() if $opts{h};
 my $zone = $opts{Z};
-$zone =~ s/^zone\.//;
+$zone =~ s/^zone\.//i;
 $zone = '' if $zone eq 'ROOT';
 
 my $data;
 my $start;
 my $stop;
-my $CRIT_DAYS = 1;
-my $WARN_DAYS = 2.5;
 
 my @refs = qw (
 a.root-servers.net
@@ -111,11 +131,14 @@ sub do_recursion {
 		print STDERR "\nRECURSE\n" if $opts{d};
 		my $pkt;
 		foreach my $ns (shuffle @refs) {
-			print STDERR "sending query for $zone RRSIG to $ns\n" if $opts{d};
+			print STDERR "sending query for $zone $opts{T} to $ns\n" if $opts{d};
 			$res->nameserver($ns);
 			$res->udp_timeout($opts{t});
-			$res->udppacketsize(4096);
-			$pkt = $res->send($zone, 'RRSIG');
+			$res->recurse(0);
+			$res->dnssec(1) if $nds;
+			$res->udppacketsize($opts{U});
+			$res->force_v4(1) if $opts{'4'};
+			$pkt = $res->send($zone, $opts{T});
 			last if $pkt;
 		}
 		warning("No response to seed query") unless $pkt;
@@ -142,9 +165,9 @@ sub do_queries {
 			next if $data->{$ns}->{done};
 			print STDERR "\nQUERY $ns\n" if $opts{d};
 
-			my $pkt = send_query($zone, 'RRSIG', $ns);
+			my $pkt = send_query($zone, $opts{T}, $ns);
 			add_nslist_to_data($pkt);
-			$data->{$ns}->{queries}->{RRSIG} = $pkt;
+			$data->{$ns}->{queries}->{$opts{T}} = $pkt;
 
 			print STDERR "done with $ns\n" if $opts{d};
 			$data->{$ns}->{done} = 1;
@@ -160,17 +183,17 @@ sub do_analyze {
 	foreach my $ns (keys %$data) {
 		print STDERR "\nANALYZE $ns\n" if $opts{d};
 		unless (ns_has_a_record($ns)) {
-			print STDERR "$ns has no A record, skipping\n" if $opts{d};
+			print STDERR "NS $ns has no A record, skipping!\n" if $opts{d};
 			next;
 		}
-		my $pkt = $data->{$ns}->{queries}->{RRSIG};
+		my $pkt = $data->{$ns}->{queries}->{$opts{T}};
 		warning("No response from $ns") unless $pkt;
 		print STDERR $pkt->string if $opts{d};
 		warning($pkt->header->rcode . " from $ns")
 			unless ($pkt->header->rcode eq 'NOERROR');
-		#next unless $pkt->header->ancount;
 		foreach my $rr ($pkt->answer) {
 			next unless $rr->type eq 'RRSIG';
+			next unless ($rr->isa('Net::DNS::RR::RRSIG'));
 			my $exp = sigrr_exp_epoch($rr);
 			my $T = $rr->typecovered;
 			if (!defined($MAX_EXP_BY_TYPE{$T}->{exp}) || $exp > $MAX_EXP_BY_TYPE{$T}->{exp}) {
@@ -194,24 +217,25 @@ sub do_analyze {
 		}
 	}
 	critical("$min_ns has expired RRSIGs") if ($min_exp < $NOW);
-	if ($min_exp - $NOW < ($CRIT_DAYS*86400)) {
+	if ($min_exp - $NOW < ($opts{C}*86400)) {
 		my $ND = sprintf "%3.1f days", ($min_exp-$NOW)/86400;
 		warning("$min_type RRSIG expires in $ND at $min_ns")
 	}
-	if ($min_exp - $NOW < ($WARN_DAYS*86400)) {
+	if ($min_exp - $NOW < ($opts{W}*86400)) {
 		my $ND = sprintf "%3.1f days", ($min_exp-$NOW)/86400;
 		warning("$min_type RRSIG expires in $ND at $min_ns")
 	}
-	success("No RRSIGs expiring in the next $WARN_DAYS days");
+	success("No RRSIGs expiring in the next $opts{W} days");
 }
 
 sub sigrr_exp_epoch {
 	my $rr = shift;
-	die unless $rr->type eq 'RRSIG';
+	die "RR type is not RRSIG!" unless $rr->type eq 'RRSIG';
+	die "RR class is not Net::DNS::RR::RRSIG!" unless ($rr->isa('Net::DNS::RR::RRSIG'));
 	my $exp = $rr->sigexpiration;
 	die "bad exp time '$exp'"
 		unless $exp =~ /^(\d\d\d\d)(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)$/;
-        my $exp_epoch = timegm($6,$5,$4,$3,$2-1,$1);
+	my $exp_epoch = timegm($6,$5,$4,$3,$2-1,$1);
 	return $exp_epoch;
 }
 
@@ -245,14 +269,23 @@ sub output {
 	my $msg = shift;
 	$stop = [gettimeofday()] unless $stop;
 	my $latency = tv_interval($start, $stop);
-	printf "%s; (%.2fs) |time=%.6fs;;;0.000000\n",
+	printf "ZONE %s: %s; (%.2fs) |time=%.6fs;;;0.000000\n",
+		$state,
 		$msg,
 		$latency,
 		$latency;
 }
 
 sub usage {
-	print STDERR "usage: $0 -Z zone\n";
+	print STDERR "usage: $0 -Z zone -t seconds -d -4 -W days -C days -T type -U bytes\n";
+	print STDERR "\t-Z zone		zone to test\n";
+	print STDERR "\t-t seconds	timeout on DNS queries (default 30)\n";
+	print STDERR "\t-d 		debugging output\n";
+	print STDERR "\t-4		use IPv4 only\n";
+	print STDERR "\t-W days		warning if expiring in X days (default 2.5)\n";
+	print STDERR "\t-C days		critical if expiring in X days (default 1)\n";
+	print STDERR "\t-T type		query type (default RRSIG)\n";
+	print STDERR "\t-U bytes	EDNS0 UDP packet size (default 4096)\n";
 	exit 3;
 }
 
@@ -264,7 +297,10 @@ sub send_query {
 	$res->nameserver($server) if $server;
 	$res->udp_timeout($opts{t});
 	$res->retry(2);
-	$res->udppacketsize(4096);
+	$res->recurse(0);
+	$res->dnssec(1) if $nds;
+	$res->udppacketsize($opts{U});
+	$res->force_v4(1) if $opts{'4'};
 	my $pkt = $res->send($qname, $qtype);
 	unless ($pkt) {
 		$res->usevc(1);
@@ -305,8 +341,7 @@ sub get_nslist {
 	return @nslist;
 }
 
-sub zone_match
-{
+sub zone_match {
 	my $a = shift;
 	my $b = shift;
 	$a = '.' unless length($a);

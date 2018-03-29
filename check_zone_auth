@@ -1,25 +1,31 @@
-#!/usr/local/bin/perl
+#!/usr/bin/perl
 
-# $Id: check_zone_auth,v 1.31 2014/03/29 22:25:05 wfms Exp $
+# $Id: check_zone_auth,v 1.32 2018/03/28 13:35:05 matt.christian Exp $
 #
 # check_zone_auth
 #
-# nagios plugin to check that all authoritative nameservers for a zone
-# have the same NS RRset and the same serial number.
+# Nagios plugin to check that all nameservers for a domain zone are:
+# authoritative, supporting EDNS0, NOT lame,
+# consistent RRsets for parent and zone, consistent RRsets for NSs,
+# NOT open resolvers, responding, and supporting TCP.
+#
+# NOT default: an IPv6 NS, NS clock skew and serial numbers match.
 #
 # options
-#	-Z zone to test
-#	-d enable debugging
-#	-A test for AA only
-#	-L test for lameness only
-#	-N test for NS RRset consistency only
-#	-O test for open recursion
-#	-R test for RCODE
-#	-S test for serial match only
-#	-T test for TCP query support
-#	-E test for EDNS support
-#	-6 test of one IPv6 reachable nameserver
-#	-K test for clock skew
+#  -Z zone	Zone to test
+#  -d		Enable debugging output
+#  -t seconds   UDP/TCP query timeout (default 10 seconds)
+#  -6		An IPv6 reachable NS (NOT default)
+#  -A		Authoritative NSs
+#  -E		EDNS0 support
+#  -K		NS clock skew (NOT default)
+#  -L		NS lameness
+#  -M		Parent and Zone NS RRsets consistency
+#  -N		NS RRset consistency
+#  -O		Open NS resolvers
+#  -R		NSs responding
+#  -S		Serial numbers match (NOT default)
+#  -T		TCP support
 
 # Copyright (c) 2008, The Measurement Factory, Inc. All rights reserved.
 #
@@ -49,13 +55,13 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-# With modifications made by DNS-OARC
+# With modifications made by DNS-OARC and Matt Christian.
 
 # usage
 #
 # define command {
 #   command_name    check-zone-auth
-#   command_line    /usr/local/libexec/nagios-local/check_zone_auth -Z $HOSTADDRESS$
+#   command_line    /usr/lib64/nagios/plugins/check_zone_auth -Z $HOSTADDRESS$
 # }
 #
 # define service {
@@ -81,23 +87,47 @@ use strict;
 use Getopt::Std;
 use Net::DNS::Resolver;
 use Net::DNS::Resolver::Recurse;
-use Time::HiRes qw ( gettimeofday tv_interval);
+use Time::HiRes qw ( gettimeofday tv_interval );
 use List::Util qw ( shuffle );
 use Storable;
-use Data::Dumper;
-use List::Compare;
+
+# Try to load List::Compare PM for optional RRset (-M) support.
+# A requirement for RRset support (-M) in the DNS-OARC version.
+# On RPM-based systems run: yum -y install perl-List-Compare
+my $licmp = eval {
+  require List::Compare;
+  List::Compare->import();
+  1;
+};
+
+# Try to load Net::DNS::RR:TSIG PM for optional clock skew (-K) support.
+# A requirement for clock skew support (-K) in the DNS-OARC version.
+my $ndrt = eval {
+  require Net::DNS;
+  # The TSIG code requires Net::DNS 0.73 or newer PM.
+  Net::DNS->VERSION(0.73);
+  Net::DNS->import();
+  require Net::DNS::RR::TSIG;
+  Net::DNS::RR::TSIG->import();
+  1;
+};
 
 my %opts = (t=>10);
-getopts('t:Z:dAEKLNMORST6', \%opts);
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+$main::VERSION = '1.32';
+my $options = 't:Z:dh6AEKLMNORST';
+getopts($options, \%opts);
 usage() unless $opts{Z};
 usage() if $opts{h};
 my $zone = $opts{Z};
-$zone =~ s/^zone\.//;
+$zone =~ s/^zone\.//i;
 $zone = '.' if $zone eq 'ROOT';
-#$zone =~ tr/A-Z/a-z/;
 
-unless ($opts{A} || $opts{E} || $opts{L} || $opts{N} || $opts{O} || $opts{R} || $opts{S} || $opts{T} || $opts{6} || $opts{M} || $opts{K}) {
-	$opts{A} =  $opts{E} =  $opts{L} =  $opts{N} =  $opts{O} =  $opts{R} =  $opts{S} =  $opts{T} =  $opts{6} = $opts{K} = 1;
+# Default options to enable, if none were explicitly requested.
+unless ($opts{6} || $opts{A} || $opts{E} || $opts{K} || $opts{L} ||
+	$opts{M} || $opts{N} || $opts{O} || $opts{R} || $opts{S} || $opts{T}) {
+	# All EXCEPT IPv6, Clock Skew and Serial Numbers match
+	$opts{A} = $opts{E} = $opts{L} = $opts{M} = $opts{N} = $opts{O} = $opts{R} = $opts{T} = 1;
 }
 
 my $data;
@@ -216,9 +246,9 @@ sub do_analyze {
 		print STDERR "\nRESPONSE FROM $ns\n" if $opts{d};
 		print STDERR $soa_pkt->string if $opts{d};
 	}
-	warning("No nameservers found.  Is '$zone' a zone?") if ($nscount < 1);
+	warning("No NSs found.  Is '$zone' a zone?") if ($nscount < 1);
 
-	# RCODE CHECK
+	# Responding CHECK
 	if ($opts{R}) {
 	    my $N = 0;
 	    foreach my $ns (keys %$data) {
@@ -227,7 +257,7 @@ sub do_analyze {
 		critical($soa_pkt->header->rcode . " from %NS%", $ns) unless ($soa_pkt->header->rcode eq 'NOERROR');
 		$N++;
 	    }
-	    success("$N nameservers responding");
+	    $success_msg .= "$N NSs are responding; ";
 	}
 
 	# LAME CHECK
@@ -240,7 +270,7 @@ sub do_analyze {
 		critical("%NS% is lame", $ns) if is_lame($soa_pkt);
 		$N++;
 	    }
-	    success("$N nameservers are not lame");
+	    $success_msg .= "$N NSs are NOT lame; ";
 	}
 
 	# NSSET CHECK
@@ -262,7 +292,7 @@ sub do_analyze {
 		next unless is_noerror($soa_pkt);
 		next if is_lame($soa_pkt);
 
-		# see if this nameserver lists all nameservers
+		# see if this NS lists all NSs
 		#
 		my %all_ns;
 		foreach my $ns (keys %$data) { $all_ns{$ns} = 1; }
@@ -277,14 +307,14 @@ sub do_analyze {
 	    my @x;
 	    foreach my $k (keys %$probs) {
 		my $nses = join(',', sort {$a cmp $b} keys %{$probs->{$k}});
-		push(@x, "$nses do not list $k");
+		push(@x, "$nses do NOT list $k");
 	    }
 	    critical("NS RRset inconsistency: ". join('; ', @x)) if @x;
-	    success("$N namesevers have consistent NS RRset");
+	    $success_msg .= "$N NSs have consistent NS RRset; ";
 	}
 
-	# NEW NSSET CHECK
-	if ($opts{M}) {
+	# NSSET CHECK
+	if ($opts{M} && $licmp) {
 	 	my @Llist = keys %$parent_data;
 		my %hash;
 		foreach my $ns (keys %$data) {
@@ -303,8 +333,8 @@ sub do_analyze {
 		my @x;
 		push(@x, "AT PARENT ONLY: ". join(' ', $lc->get_Lonly)) if $lc->get_Lonly;
 		push(@x, "IN ZONE ONLY: ". join(' ', $lc->get_Ronly)) if $lc->get_Ronly;
-		critical (join('; ', @x)) if @x;
-		success("Parent and Zone NS RRSets match");
+		critical(join('; ', @x)) if @x;
+		$success_msg .= "Parent and Zone NS RRsets match; ";
 	}
 
 
@@ -315,10 +345,10 @@ sub do_analyze {
 		my $soa_pkt = $data->{$ns}->{queries}->{SOA};
 		next unless is_response($soa_pkt);
 		next unless is_noerror($soa_pkt);
-		critical("%NS% claims is it not authoritative", $ns) unless $soa_pkt->header->aa;
+		critical("%NS% is NOT authoritative", $ns) unless $soa_pkt->header->aa;
 		$N++;
 	    }
-	    success("$N namesevers are authoritative");
+	    $success_msg .= "$N NSs are authoritative; ";
 	}
 
 	# SERIAL CHECK
@@ -352,7 +382,7 @@ sub do_analyze {
 		#
 		critical("%NS% serial ($serial) is less than the maximum ($maxserial)", $ns);
 	    }
-	    success("$N nameservers have serial $maxserial");
+	    $success_msg .= "$N NSs have serial $maxserial; ";
 	}
 
 	# OPENRES CHECK
@@ -365,7 +395,8 @@ sub do_analyze {
 		critical("%NS% is an open resolver", $ns) if test_recursion($ns);
 		$N++;
 	    }
-	    success("$N nameservers are closed to recursion");
+	    # This message WAS "closed to recursion"
+	    $success_msg .= "$N NSs are NOT open resolvers; ";
 	}
 
 	# TCP CHECK
@@ -382,12 +413,12 @@ sub do_analyze {
 	    if (%broke) {
 		my $K = int(keys %broke);
 		my $such = (keys %broke)[0];
-		critical("$K of $N nameservers (such as %NS%) do not support TCP", $such);
+		critical("$K of $N NSs (such as %NS%) do NOT support TCP", $such);
 	    }
-	    success("$N nameservers support TCP");
+	    $success_msg .= "$N NSs support TCP; ";
 	}
 
-	# EDNS CHECK
+	# EDNS0 CHECK
 	if ($opts{E}) {
 	    my $N = 0;
 	    my $res = Net::DNS::Resolver->new;
@@ -400,32 +431,32 @@ sub do_analyze {
 		next unless is_noerror($soa_pkt);
 		my @addrs = nsaddrs($ns);
 		unless (@addrs) {
-			critical("cant get nameservers for %NS%", $ns);
+			critical("cant get NSs for %NS%", $ns);
 		}
 		$res->nameserver(@addrs);
 		my $pkt = $res->send($zone, 'SOA');
-		critical("%NS% does not support EDNS0 (timeout)", $ns) unless $pkt;
+		critical("%NS% does NOT support EDNS0 (timeout)", $ns) unless $pkt;
 		my $rc = $pkt->header->rcode;
-		critical("%NS% does not support EDNS0 (rcode $rc)", $ns) unless $rc eq 'NOERROR';
+		critical("%NS% does NOT support EDNS0 (rcode $rc)", $ns) unless $rc eq 'NOERROR';
 		$N++;
 	    }
-	    success("$N nameservers support EDNS0");
+	    $success_msg .= "$N NSs support EDNS0; ";
 	}
 
-	# IPV6 CHECK
+	# IPv6 CHECK
 	if ($opts{6}) {
 	    my %xns = ();
 	    my $res = Net::DNS::Resolver->new;
 	    $res->udp_timeout($opts{t});
 	    $res->tcp_timeout($opts{t});
 	    foreach my $ns (keys %$data) {
-		printf STDERR "Does %s have an AAAA record?\n", $ns if $opts{d};
+		printf STDERR "Does NS %s have an AAAA record?\n", $ns if $opts{d};
 		my $aaaa_pkt = $res->query($ns, 'AAAA');
 	    	next unless $aaaa_pkt;
 	    	next unless $aaaa_pkt->header->rcode eq 'NOERROR';
 		next unless $aaaa_pkt->header->ancount;
 		foreach my $rr ($aaaa_pkt->answer) {
-		 	# if this NS has multiple v6 addrs, we're only going test one
+		 	# if this NS has multiple IPv6 addrs, we're only going test one
 			next unless $rr->type eq 'AAAA';
 			next unless lc($rr->name) eq lc($ns);
 			$xns{$ns} = $rr->address;
@@ -439,16 +470,16 @@ sub do_analyze {
 		printf STDERR "Querying %s...\n", $xns{$ns} if $opts{d};
 		$res->nameserver($xns{$ns});
 		my $pkt = $res->send($zone, 'SOA');
-		critical("$ns does not support IPv6 (timeout)") unless $pkt;
+		critical("$ns does NOT support IPv6 (timeout)") unless $pkt;
 		my $rc = $pkt->header->rcode;
-		critical("%NS% does not support IPv6 (rcode $rc)", $ns, 'AAAA') unless $rc eq 'NOERROR';
+		critical("%NS% does NOT support IPv6 (rcode $rc)", $ns, 'AAAA') unless $rc eq 'NOERROR';
 		$N++;
 	    }
-	    success("$N nameservers support IPv6");
+	    $success_msg .= "$N NSs support IPv6; ";
 	}
 
 	## Clock skew
-	if ($opts{K}) {
+	if ($opts{K} && $ndrt) {
 	    my $maxskew = 0;
 	    my $maxskew_ns = undef;
 	    my $N = 0;
@@ -458,13 +489,13 @@ sub do_analyze {
 	        $res->tcp_timeout($opts{t});
 		my @addrs = nsaddrs($ns);
 		unless (@addrs) {
-			critical("cant get nameservers for %NS%", $ns);
+			critical("cant get NSs for %NS%", $ns);
 		}
 		$res->nameserver(@addrs);
 		my $key_name = 'tldmon.dns-oarc.net';
 		my $key = 'deadbeef+deadbeef+dead==';	# anything;
 		my $query = Net::DNS::Packet->new('tldmon.dns-oarc.net');
-		my $tsig = Net::DNS::RR->new("$key_name, $key");
+		my $tsig = Net::DNS::RR::TSIG->create($key_name, $key);
 		$query->push(additional => $tsig);
 		my $reply = $res->send($query);
 		next unless $reply;
@@ -480,10 +511,10 @@ sub do_analyze {
 	    }
 	    critical("%NS% clock skew is $maxskew seconds", $maxskew_ns, 'A') if $maxskew > 60;
 	    warning("%NS% clock skew is $maxskew seconds", $maxskew_ns, 'A') if $maxskew > 15;
-	    success("$N nameservers clocks reasonably in sync");
+	    $success_msg .= "$N NS clocks in sync; ";
 	}
 
-	die "oof";
+	success($success_msg);
 }
 
 sub add_nslist_to_data {
@@ -522,9 +553,8 @@ sub critical {
 	my $msg = shift;
 	my $ns = shift;
 	my $atype = shift;
-	warning($msg, $ns, $atype);
-	#output('CRITICAL', shift);
-	#exit(2);
+	output('CRITICAL', $msg, $ns, $atype);
+	exit(2);
 }
 
 sub output {
@@ -573,7 +603,21 @@ sub HOSTNAME_BIND {
 }
 
 sub usage {
-	print STDERR "usage: $0 -Z zone\n";
+	print STDERR "usage: $0 -Z zone -d -t seconds -6AEKLMNORST\n";
+	print STDERR "\t-Z zone		Zone to test\n";
+	print STDERR "\t-d		Enable debugging output\n";
+	print STDERR "\t-t seconds	UDP/TCP query timeout (default 10)\n";
+	print STDERR "\t-6		IPv6 reachable NS (NOT default)\n";
+	print STDERR "\t-A		Authoritative NSs\n";
+	print STDERR "\t-E		EDNS0 support\n";
+	print STDERR "\t-K		NS clock skew (NOT default)\n";
+	print STDERR "\t-L		NS lameness\n";
+	print STDERR "\t-M		Parent and Zone NS RRsets consistency\n";
+	print STDERR "\t-N		NS RRset consistency\n";
+	print STDERR "\t-O		Open NS resolvers\n";
+	print STDERR "\t-R		NSs responding\n";
+	print STDERR "\t-S		Serial numbers match (NOT default)\n";
+	print STDERR "\t-T		TCP query support\n";
 	exit 3;
 }
 
@@ -589,13 +633,12 @@ sub nsaddrs {
 		foreach my $rr ($pkt->answer) {
 			next unless $qtype eq $rr->type;
 			next unless lc($nsname) eq lc($rr->name);
-			print STDERR "nslookup $nsname has address ". $rr->address. "\n";
+			print STDERR "nslookup $nsname has address ". $rr->address. "\n" if $opts{d};
 			push(@addrs, $rr->address);
 		}
 	}
 	unless (@addrs) {
 		print STDERR "Unknown host $nsname\n" if $opts{d};
-#		push(@addrs, $nsname);
 	}
 	return @addrs;
 }
